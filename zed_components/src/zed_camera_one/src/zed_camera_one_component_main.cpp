@@ -100,6 +100,20 @@ ZedCameraOne::ZedCameraOne(const rclcpp::NodeOptions & options)
 #endif
   // <---- Publishers/Subscribers options
 
+  // ----> Open the camera before the node's executor runs any callback
+  // As in ZedCamera: under CPU load, opening the camera from initNode() (a timer callback on the node's
+  // executor thread) can fail; opening it here, before the executor runs, does not. A temporary non-owning
+  // shared_ptr makes shared_from_this() available for reading the parameters; the factory's owner takes over
+  // after this block.
+  // If this open fails, startCamera() tries again as before.
+  {
+    const std::shared_ptr<ZedCameraOne> self(this, [](ZedCameraOne *) {});
+    initParameters();
+    _paramsInitialized = true;
+    openCameraEarly();
+  }
+  // <---- Open the camera before the node's executor runs any callback
+
   // ----> Start a "one shot timer" to initialize the node
   // This is required to make `shared_from_this` available
   std::chrono::milliseconds init_msec(static_cast<int>(50.0));
@@ -755,8 +769,11 @@ void ZedCameraOne::initNode()
   _diagUpdater.setHardwareID(hw_id);
   // <---- Diagnostic initialization
 
-  // Parameters initialization
-  initParameters();
+  // Parameters initialization (normally done in the constructor already)
+  if (!_paramsInitialized) {
+    initParameters();
+    _paramsInitialized = true;
+  }
 
   // Services initialization
   initServices();
@@ -851,8 +868,10 @@ bool ZedCameraOne::startCamera()
   createZedObject();
   logSdkVersion();
   setupTf2();
-  configureZedInput();
-  setZedInitParams();
+  if (!_cameraOpenedEarly) {
+    configureZedInput();
+    setZedInitParams();
+  }
 
   if (!openZedCamera()) {
     return false;
@@ -896,7 +915,9 @@ bool ZedCameraOne::startCamera()
 
 void ZedCameraOne::createZedObject()
 {
-  _zed = std::make_shared<sl::CameraOne>();
+  if (!_cameraOpenedEarly) {  // else the constructor has already opened it
+    _zed = std::make_shared<sl::CameraOne>();
+  }
 }
 
 void ZedCameraOne::logSdkVersion()
@@ -976,15 +997,8 @@ void ZedCameraOne::setZedInitParams()
   _initParams.sdk_verbose_log_file = _sdkVerboseLogFile.c_str();
 }
 
-bool ZedCameraOne::openZedCamera()
+void ZedCameraOne::setSdkTimestampClock()
 {
-  _grabStatus = sl::ERROR_CODE::LAST;
-
-  // Tell sl_tools whether timestamps come from a replay source (SVO) so
-  // slTime2Ros bypasses the live monotonic-clock offset for recorded values.
-  // Mono component has no simulation mode.
-  sl_tools::setSdkReplayMode(_svoMode);
-
 #if (ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) >= 53
   if (_useSdkMonotonicClock) {
     sl::Camera::setTimestampClock(sl::TIMESTAMP_CLOCK::MONOTONIC_CLOCK);
@@ -1001,8 +1015,51 @@ bool ZedCameraOne::openZedCamera()
     }
   }
 #endif
+}
 
-  _connStatus = _zed->open(_initParams);
+void ZedCameraOne::openCameraEarly()
+{
+  if (!_svoFilepath.empty() || !_streamAddr.empty()) {
+    return;  // live cameras only: SVO files and streams open in startCamera()
+  }
+
+  createZedObject();
+  configureZedInput();
+  setZedInitParams();
+  sl_tools::setSdkReplayMode(false);
+  setSdkTimestampClock();
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const sl::ERROR_CODE err = _zed->open(_initParams);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - t0).count();
+  if (err == sl::ERROR_CODE::SUCCESS) {
+    _cameraOpenedEarly = true;
+    RCLCPP_INFO_STREAM(get_logger(), "Camera opened before node start-up in " << ms << " ms");
+  } else {
+    RCLCPP_WARN_STREAM(
+      get_logger(), "Opening the camera before node start-up failed after " << ms << " ms ("
+        << sl::toString(err).c_str() << "); retrying during start-up");
+    _zed->close();
+    _zed.reset();
+  }
+}
+
+bool ZedCameraOne::openZedCamera()
+{
+  _grabStatus = sl::ERROR_CODE::LAST;
+
+  // Tell sl_tools whether timestamps come from a replay source (SVO) so
+  // slTime2Ros bypasses the live monotonic-clock offset for recorded values.
+  // Mono component has no simulation mode.
+  sl_tools::setSdkReplayMode(_svoMode);
+
+  if (_cameraOpenedEarly) {
+    _connStatus = sl::ERROR_CODE::SUCCESS;  // opened in the constructor
+  } else {
+    setSdkTimestampClock();
+    _connStatus = _zed->open(_initParams);
+  }
 
   if (_connStatus != sl::ERROR_CODE::SUCCESS) {
 

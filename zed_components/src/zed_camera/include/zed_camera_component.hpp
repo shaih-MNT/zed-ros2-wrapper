@@ -88,6 +88,9 @@ protected:
     bool rawParam = false);
 
   bool startCamera();
+  bool configureInitParams();  // mInitParams from the parameters
+  void setSdkTimestampClock();
+  void openCameraEarly();      // in the constructor, before the executor runs
   bool startPosTracking();
   bool startPosTrackingLocked();  // caller must hold mPtMutex
   bool saveAreaMemoryFile(const std::string & filePath);
@@ -401,6 +404,8 @@ protected:
 private:
   // ZED SDK
   std::shared_ptr<sl::Camera> mZed;
+  bool mParamsInitialized = false;  // initParameters() done (in the constructor)
+  bool mCameraOpenedEarly = false;  // camera opened in the constructor
   sl::InitParameters mInitParams;
   sl::RuntimeParameters mRunParams;
 

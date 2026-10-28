@@ -77,6 +77,8 @@ protected:
   bool startCamera();
   void closeCamera();
   void createZedObject();
+  void setSdkTimestampClock();
+  void openCameraEarly();  // in the constructor, before the executor runs
   void logSdkVersion();
   void setupTf2();
   void configureZedInput();
@@ -248,6 +250,8 @@ protected:
 private:
   // ----> ZED SDK
   std::shared_ptr<sl::CameraOne> _zed;
+  bool _paramsInitialized = false;  // initParameters() done (in the constructor)
+  bool _cameraOpenedEarly = false;  // camera opened in the constructor
   sl::InitParametersOne _initParams;
   // <---- ZED SDK
 

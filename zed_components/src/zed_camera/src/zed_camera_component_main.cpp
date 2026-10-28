@@ -153,6 +153,20 @@ ZedCamera::ZedCamera(const rclcpp::NodeOptions & options)
     sl::setEnvironmentVariable("ZED_SDK_DISABLE_PROGRESS_BAR_LOG", "1");
   #endif
 
+    // ----> Open the camera before the node's executor runs any callback
+    // Under CPU load, opening the camera from initNode() (a timer callback on the node's executor thread)
+    // can fail; opening it here, before the executor runs, does not. Reading the parameters needs
+    // shared_from_this(), which a constructor doesn't have yet: a temporary non-owning shared_ptr provides
+    // it. It has expired at the end of this block, so the owner the component factory creates takes over
+    // (C++17 enable_shared_from_this rules). If this open fails, startCamera() retries as before.
+    {
+      const std::shared_ptr<ZedCamera> self(this, [](ZedCamera *) {});
+      initParameters();
+      mParamsInitialized = true;
+      openCameraEarly();
+    }
+    // <---- Open the camera before the node's executor runs any callback
+
     // ----> Start a "one shot timer" to initialize the node and make `shared_from_this` available
     DEBUG_COMM("Creating one-shot initialization timer...");
     mInitTimer = create_wall_timer(
@@ -192,8 +206,11 @@ void ZedCamera::initNode()
 #endif
   // <---- Publishers/Subscribers options
 
-  // Parameters initialization
-  initParameters();
+  // Parameters initialization (normally done in the constructor already)
+  if (!mParamsInitialized) {
+    initParameters();
+    mParamsInitialized = true;
+  }
 
   // ----> Diagnostic initialization
   std::string info = sl::toString(mCamUserModel).c_str();
@@ -2724,8 +2741,10 @@ bool ZedCamera::startCamera()
   // int ctx_gpu_id;
   // cudaGetDevice(&ctx_gpu_id);
 
-  // Create a ZED object
-  mZed = std::make_shared<sl::Camera>();
+  // Create a ZED object, unless the constructor has already opened the camera
+  if (!mCameraOpenedEarly) {
+    mZed = std::make_shared<sl::Camera>();
+  }
 
   // ----> SDK version
   RCLCPP_INFO(
@@ -2751,149 +2770,8 @@ bool ZedCamera::startCamera()
   // <---- TF2 Transform
 
   // ----> ZED configuration
-
-  // if (primary_cuda_context) {
-  //   mInitParams.sdk_cuda_ctx = *primary_cuda_context;
-  // } else {
-  //   RCLCPP_INFO(
-  //     get_logger(),
-  //     "No ready CUDA context found, using default ZED SDK context.");
-  // }
-
-  if (mSimMode) {  // Simulation?
-    RCLCPP_INFO_STREAM(
-      get_logger(), "=== CONNECTING TO THE SIMULATION SERVER ["
-        << mSimAddr.c_str() << ":" << mSimPort
-        << "] ===");
-
-    mInitParams.input.setFromStream(mSimAddr.c_str(), mSimPort);
-  } else if (!mSvoFilepath.empty()) {
-    RCLCPP_INFO(get_logger(), "=== SVO OPENING ===");
-
-    mInitParams.input.setFromSVOFile(mSvoFilepath.c_str());
-    mInitParams.svo_real_time_mode = mSvoRealtime;
-#if (ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) >= 53
-    mInitParams.svo_decryption_key = mSvoDecryptionKey.c_str();
-#endif
-  } else if (!mStreamAddr.empty()) {
-    RCLCPP_INFO(get_logger(), "=== LOCAL STREAMING OPENING ===");
-
-    mInitParams.input.setFromStream(
-      mStreamAddr.c_str(),
-      static_cast<unsigned short>(mStreamPort));
-  } else {
-    RCLCPP_INFO(get_logger(), "=== CAMERA OPENING ===");
-
-    mInitParams.camera_fps = mCamGrabFrameRate;
-    mInitParams.grab_compute_capping_fps = static_cast<float>(mGrabComputeCappingFps);
-    mInitParams.camera_resolution = static_cast<sl::RESOLUTION>(mCamResol);
-    mInitParams.async_image_retrieval = mAsyncImageRetrieval;
-    mInitParams.enable_image_validity_check = mImageValidityCheck;
-
-    if (mCamUserModel == sl::MODEL::VIRTUAL_ZED_X) {
-      if (mCamVirtualSerialNumbers.size() == 2) {
-        // Generate the virtual serial number from the two real serial numbers
-        auto virtual_sn =
-          sl::generateVirtualStereoSerialNumber(
-          mCamVirtualSerialNumbers[0],
-          mCamVirtualSerialNumbers[1]);
-        mInitParams.input.setVirtualStereoFromSerialNumbers(
-          mCamVirtualSerialNumbers[0], mCamVirtualSerialNumbers[1], virtual_sn);
-      } else if (mCamVirtualCameraIds.size() == 2) {
-
-        // Here we need the ZED X One serial numbers to generate the virtual camera SN
-        auto cams = sl::CameraOne::getDeviceList();
-        std::vector<int> serials;
-        for (const auto & cam : cams) {
-          if (std::any_of(
-              mCamVirtualCameraIds.begin(), mCamVirtualCameraIds.end(),
-              [&cam](int id) {return cam.id == id;}))
-          {
-            serials.push_back(cam.serial_number);
-          }
-        }
-
-        if (serials.size() < 2) {
-          RCLCPP_ERROR(
-            get_logger(),
-            "To use VIRTUAL_ZED_X model with camera IDs, the cameras must be connected and recognized by the system.");
-          return false;
-        }
-
-        // Generate the virtual serial number from the two real serial numbers
-        auto virtual_sn = sl::generateVirtualStereoSerialNumber(serials[0], serials[1]);
-
-        mInitParams.input.setVirtualStereoFromCameraIDs(
-          mCamVirtualCameraIds[0], mCamVirtualCameraIds[1], virtual_sn);
-      } else {
-        RCLCPP_ERROR(
-          get_logger(),
-          "To use VIRTUAL_ZED_X model, you must provide either two VALID serial numbers or two VALID camera IDs.");
-        return false;
-      }
-    } else {
-      if (mCamSerialNumber > 0) {
-        mInitParams.input.setFromSerialNumber(mCamSerialNumber);
-      } else if (mCamId >= 0) {
-        mInitParams.input.setFromCameraID(mCamId);
-      }
-    }
-  }
-
-  mInitParams.coordinate_system = ROS_COORDINATE_SYSTEM;
-  mInitParams.coordinate_units = ROS_MEAS_UNITS;
-  mInitParams.depth_mode = mDepthMode;
-
-  // Set env var for custom depth model override if specified
-  if (!mDepthModelOverride.empty()) {
-#if (ZED_SDK_MAJOR_VERSION < 5) || \
-    (ZED_SDK_MAJOR_VERSION == 5 && ZED_SDK_MINOR_VERSION < 2) || \
-    (ZED_SDK_MAJOR_VERSION == 5 && ZED_SDK_MINOR_VERSION == 2 && ZED_SDK_PATCH_VERSION < 2)
-    RCLCPP_WARN(
-      get_logger(),
-      "*** Depth model override requires ZED SDK >= 5.2.2. "
-      "Current SDK version is %d.%d.%d. The override will likely be ignored. ***",
-      ZED_SDK_MAJOR_VERSION, ZED_SDK_MINOR_VERSION, ZED_SDK_PATCH_VERSION);
-#endif
-    std::string depth_mode_name = sl_tools::toUpper(
-      std::string(sl::toString(mDepthMode).c_str()));
-    std::string env_var = "ZED_SDK_OVERRIDE_" + depth_mode_name;
-    setenv(env_var.c_str(), mDepthModelOverride.c_str(), 1);
-    RCLCPP_WARN_STREAM(
-      get_logger(),
-      "*** DEPTH MODEL OVERRIDE ACTIVE ***\n"
-        << "  Mode:     " << sl::toString(mDepthMode).c_str() << "\n"
-        << "  Model:    " << mDepthModelOverride << "\n"
-        << "  Env var:  " << env_var << "=" << mDepthModelOverride);
-  }
-
-  mInitParams.sdk_verbose = mVerbose;
-  mInitParams.sdk_verbose_log_file = mVerboseLogFile.c_str();
-  mInitParams.sdk_gpu_id = mGpuId;
-  if (mDepthStabilization >= 0) {
-    mInitParams.depth_stabilization = mDepthStabilization;
-  }  // else: keep SDK constructed default
-  mInitParams.camera_image_flip = (mCameraFlip ? sl::FLIP_MODE::ON : sl::FLIP_MODE::OFF);
-  mInitParams.depth_minimum_distance = mCamMinDepth;
-  mInitParams.depth_maximum_distance = mCamMaxDepth;
-
-  if (!mOpencvCalibFile.empty()) {
-    mInitParams.optional_opencv_calibration_file = mOpencvCalibFile.c_str();
-  }
-
-  mInitParams.camera_disable_self_calib = !mCameraSelfCalib;
-  mInitParams.enable_image_enhancement = true;
-  mInitParams.enable_right_side_measure = false;
-
-  mInitParams.async_grab_camera_recovery =
-    true;    // Camera recovery is handled asynchronously to provide information
-             // about this status
-
-  // Set the maximum working resolution between video and point cloud to boost the pipeline processing
-  if (mMatResol.width > mPcResol.width) {
-    mInitParams.maximum_working_resolution = mMatResol;
-  } else {
-    mInitParams.maximum_working_resolution = mPcResol;
+  if (!mCameraOpenedEarly && !configureInitParams()) {
+    return false;
   }
   // <---- ZED configuration
 
@@ -2908,27 +2786,18 @@ bool ZedCamera::startCamera()
   // monotonic-clock offset to file-recorded values. Process-wide.
   sl_tools::setSdkReplayMode(mSvoMode || mSimMode);
 
-#if (ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) >= 53
-  if (mUseSdkMonotonicClock) {
-    sl::Camera::setTimestampClock(sl::TIMESTAMP_CLOCK::MONOTONIC_CLOCK);
-    if (sl::Camera::getTimestampClock() != sl::TIMESTAMP_CLOCK::MONOTONIC_CLOCK) {
-      RCLCPP_WARN(
-        get_logger(),
-        "Another node in this process already set the SDK timestamp clock; "
-        "this node's 'general.sdk_use_monotonic_clock' request was ignored.");
-      mUseSdkMonotonicClock = false;
-    } else {
-      RCLCPP_INFO(
-        get_logger(),
-        "SDK timestamp clock set to MONOTONIC_CLOCK (process-wide).");
-    }
+  if (!mCameraOpenedEarly) {
+    setSdkTimestampClock();
   }
-#endif
 
   while (1) {
-    rclcpp::sleep_for(500ms);
+    if (mCameraOpenedEarly) {
+      mConnStatus = sl::ERROR_CODE::SUCCESS;  // opened in the constructor
+    } else {
+      rclcpp::sleep_for(500ms);
 
-    mConnStatus = mZed->open(mInitParams);
+      mConnStatus = mZed->open(mInitParams);
+    }
 
     if (mConnStatus == sl::ERROR_CODE::SUCCESS) {
       DEBUG_STREAM_COMM("Opening successfull");
@@ -3825,6 +3694,206 @@ bool ZedCamera::startCamera()
 
   return true;
 }  // namespace stereolabs
+
+bool ZedCamera::configureInitParams()
+{
+
+  // if (primary_cuda_context) {
+  //   mInitParams.sdk_cuda_ctx = *primary_cuda_context;
+  // } else {
+  //   RCLCPP_INFO(
+  //     get_logger(),
+  //     "No ready CUDA context found, using default ZED SDK context.");
+  // }
+
+  if (mSimMode) {  // Simulation?
+    RCLCPP_INFO_STREAM(
+      get_logger(), "=== CONNECTING TO THE SIMULATION SERVER ["
+        << mSimAddr.c_str() << ":" << mSimPort
+        << "] ===");
+
+    mInitParams.input.setFromStream(mSimAddr.c_str(), mSimPort);
+  } else if (!mSvoFilepath.empty()) {
+    RCLCPP_INFO(get_logger(), "=== SVO OPENING ===");
+
+    mInitParams.input.setFromSVOFile(mSvoFilepath.c_str());
+    mInitParams.svo_real_time_mode = mSvoRealtime;
+#if (ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) >= 53
+    mInitParams.svo_decryption_key = mSvoDecryptionKey.c_str();
+#endif
+  } else if (!mStreamAddr.empty()) {
+    RCLCPP_INFO(get_logger(), "=== LOCAL STREAMING OPENING ===");
+
+    mInitParams.input.setFromStream(
+      mStreamAddr.c_str(),
+      static_cast<unsigned short>(mStreamPort));
+  } else {
+    RCLCPP_INFO(get_logger(), "=== CAMERA OPENING ===");
+
+    mInitParams.camera_fps = mCamGrabFrameRate;
+    mInitParams.grab_compute_capping_fps = static_cast<float>(mGrabComputeCappingFps);
+    mInitParams.camera_resolution = static_cast<sl::RESOLUTION>(mCamResol);
+    mInitParams.async_image_retrieval = mAsyncImageRetrieval;
+    mInitParams.enable_image_validity_check = mImageValidityCheck;
+
+    if (mCamUserModel == sl::MODEL::VIRTUAL_ZED_X) {
+      if (mCamVirtualSerialNumbers.size() == 2) {
+        // Generate the virtual serial number from the two real serial numbers
+        auto virtual_sn =
+          sl::generateVirtualStereoSerialNumber(
+          mCamVirtualSerialNumbers[0],
+          mCamVirtualSerialNumbers[1]);
+        mInitParams.input.setVirtualStereoFromSerialNumbers(
+          mCamVirtualSerialNumbers[0], mCamVirtualSerialNumbers[1], virtual_sn);
+      } else if (mCamVirtualCameraIds.size() == 2) {
+
+        // Here we need the ZED X One serial numbers to generate the virtual camera SN
+        auto cams = sl::CameraOne::getDeviceList();
+        std::vector<int> serials;
+        for (const auto & cam : cams) {
+          if (std::any_of(
+              mCamVirtualCameraIds.begin(), mCamVirtualCameraIds.end(),
+              [&cam](int id) {return cam.id == id;}))
+          {
+            serials.push_back(cam.serial_number);
+          }
+        }
+
+        if (serials.size() < 2) {
+          RCLCPP_ERROR(
+            get_logger(),
+            "To use VIRTUAL_ZED_X model with camera IDs, the cameras must be connected and recognized by the system.");
+          return false;
+        }
+
+        // Generate the virtual serial number from the two real serial numbers
+        auto virtual_sn = sl::generateVirtualStereoSerialNumber(serials[0], serials[1]);
+
+        mInitParams.input.setVirtualStereoFromCameraIDs(
+          mCamVirtualCameraIds[0], mCamVirtualCameraIds[1], virtual_sn);
+      } else {
+        RCLCPP_ERROR(
+          get_logger(),
+          "To use VIRTUAL_ZED_X model, you must provide either two VALID serial numbers or two VALID camera IDs.");
+        return false;
+      }
+    } else {
+      if (mCamSerialNumber > 0) {
+        mInitParams.input.setFromSerialNumber(mCamSerialNumber);
+      } else if (mCamId >= 0) {
+        mInitParams.input.setFromCameraID(mCamId);
+      }
+    }
+  }
+
+  mInitParams.coordinate_system = ROS_COORDINATE_SYSTEM;
+  mInitParams.coordinate_units = ROS_MEAS_UNITS;
+  mInitParams.depth_mode = mDepthMode;
+
+  // Set env var for custom depth model override if specified
+  if (!mDepthModelOverride.empty()) {
+#if (ZED_SDK_MAJOR_VERSION < 5) || \
+    (ZED_SDK_MAJOR_VERSION == 5 && ZED_SDK_MINOR_VERSION < 2) || \
+    (ZED_SDK_MAJOR_VERSION == 5 && ZED_SDK_MINOR_VERSION == 2 && ZED_SDK_PATCH_VERSION < 2)
+    RCLCPP_WARN(
+      get_logger(),
+      "*** Depth model override requires ZED SDK >= 5.2.2. "
+      "Current SDK version is %d.%d.%d. The override will likely be ignored. ***",
+      ZED_SDK_MAJOR_VERSION, ZED_SDK_MINOR_VERSION, ZED_SDK_PATCH_VERSION);
+#endif
+    std::string depth_mode_name = sl_tools::toUpper(
+      std::string(sl::toString(mDepthMode).c_str()));
+    std::string env_var = "ZED_SDK_OVERRIDE_" + depth_mode_name;
+    setenv(env_var.c_str(), mDepthModelOverride.c_str(), 1);
+    RCLCPP_WARN_STREAM(
+      get_logger(),
+      "*** DEPTH MODEL OVERRIDE ACTIVE ***\n"
+        << "  Mode:     " << sl::toString(mDepthMode).c_str() << "\n"
+        << "  Model:    " << mDepthModelOverride << "\n"
+        << "  Env var:  " << env_var << "=" << mDepthModelOverride);
+  }
+
+  mInitParams.sdk_verbose = mVerbose;
+  mInitParams.sdk_verbose_log_file = mVerboseLogFile.c_str();
+  mInitParams.sdk_gpu_id = mGpuId;
+  if (mDepthStabilization >= 0) {
+    mInitParams.depth_stabilization = mDepthStabilization;
+  }  // else: keep SDK constructed default
+  mInitParams.camera_image_flip = (mCameraFlip ? sl::FLIP_MODE::ON : sl::FLIP_MODE::OFF);
+  mInitParams.depth_minimum_distance = mCamMinDepth;
+  mInitParams.depth_maximum_distance = mCamMaxDepth;
+
+  if (!mOpencvCalibFile.empty()) {
+    mInitParams.optional_opencv_calibration_file = mOpencvCalibFile.c_str();
+  }
+
+  mInitParams.camera_disable_self_calib = !mCameraSelfCalib;
+  mInitParams.enable_image_enhancement = true;
+  mInitParams.enable_right_side_measure = false;
+
+  mInitParams.async_grab_camera_recovery =
+    true;    // Camera recovery is handled asynchronously to provide information
+             // about this status
+
+  // Set the maximum working resolution between video and point cloud to boost the pipeline processing
+  if (mMatResol.width > mPcResol.width) {
+    mInitParams.maximum_working_resolution = mMatResol;
+  } else {
+    mInitParams.maximum_working_resolution = mPcResol;
+  }
+
+  return true;
+}
+
+void ZedCamera::setSdkTimestampClock()
+{
+#if (ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) >= 53
+  if (mUseSdkMonotonicClock) {
+    sl::Camera::setTimestampClock(sl::TIMESTAMP_CLOCK::MONOTONIC_CLOCK);
+    if (sl::Camera::getTimestampClock() != sl::TIMESTAMP_CLOCK::MONOTONIC_CLOCK) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Another node in this process already set the SDK timestamp clock; "
+        "this node's 'general.sdk_use_monotonic_clock' request was ignored.");
+      mUseSdkMonotonicClock = false;
+    } else {
+      RCLCPP_INFO(
+        get_logger(),
+        "SDK timestamp clock set to MONOTONIC_CLOCK (process-wide).");
+    }
+  }
+#endif
+}
+
+void ZedCamera::openCameraEarly()
+{
+  if (mSvoMode || mSimMode || !mStreamAddr.empty()) {
+    return;  // live cameras only: SVO files, simulation and streams open in startCamera()
+  }
+
+  mZed = std::make_shared<sl::Camera>();
+  if (!configureInitParams()) {
+    mZed.reset();
+    return;
+  }
+  sl_tools::setSdkReplayMode(false);
+  setSdkTimestampClock();
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const sl::ERROR_CODE err = mZed->open(mInitParams);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - t0).count();
+  if (err == sl::ERROR_CODE::SUCCESS) {
+    mCameraOpenedEarly = true;
+    RCLCPP_INFO_STREAM(get_logger(), "Camera opened before node start-up in " << ms << " ms");
+  } else {
+    RCLCPP_WARN_STREAM(
+      get_logger(), "Opening the camera before node start-up failed after " << ms << " ms ("
+        << sl::toString(err).c_str() << "); retrying during start-up");
+    mZed->close();
+    mZed.reset();
+  }
+}
 
 void ZedCamera::closeCamera()
 {
